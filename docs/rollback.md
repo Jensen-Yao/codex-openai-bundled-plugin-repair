@@ -29,10 +29,23 @@ Copy-Item $backup.FullName (Join-Path $codexHome "config.toml") -Force
 
 ## 删除镜像目录
 
-如果要完全清理本仓库创建的镜像：
+如果要清理本仓库创建的镜像：
 
 ```powershell
 Remove-Item "$env:USERPROFILE\.codex\bundled-marketplaces\openai-bundled" -Recurse -Force
+Remove-Item "$env:USERPROFILE\.codex\bundled-resources\plugins\openai-bundled" -Recurse -Force
 ```
 
-如果之后要继续使用内置插件，不建议删除这个目录。
+如果之后要继续使用内置插件，不建议删除这些目录。
+
+## 删除可选环境变量
+
+如果设置过可选 resources 路径，可以这样删除：
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+  "CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH",
+  $null,
+  "User"
+)
+```

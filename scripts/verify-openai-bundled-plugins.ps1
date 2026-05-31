@@ -2,42 +2,56 @@
 [CmdletBinding()]
 param(
   [string]$CodexHome = (Join-Path $env:USERPROFILE ".codex"),
-  [string[]]$Plugins = @("browser", "computer-use", "chrome")
+  [string[]]$Plugins = @("browser", "computer-use", "chrome", "latex")
 )
 
 $ErrorActionPreference = "Stop"
 
 function Resolve-CodexCli {
+  $candidates = New-Object System.Collections.Generic.List[string]
+
   $fromPath = Get-Command "codex" -ErrorAction SilentlyContinue
-  if ($fromPath) { return $fromPath.Source }
+  if ($fromPath) { $candidates.Add($fromPath.Source) }
 
-  $roots = @(
-    (Join-Path $env:ProgramFiles "WindowsApps"),
-    "C:\WindowsApps",
-    "D:\WindowsApps",
-    "E:\WindowsApps",
-    "F:\WindowsApps"
-  ) | Select-Object -Unique
+  $roots = New-Object System.Collections.Generic.List[string]
+  if ($env:ProgramFiles) {
+    $roots.Add((Join-Path $env:ProgramFiles "WindowsApps"))
+  }
+  Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+    $roots.Add((Join-Path $_.Root "WindowsApps"))
+  }
 
-  foreach ($root in $roots) {
+  foreach ($root in ($roots | Select-Object -Unique)) {
     if (-not (Test-Path -LiteralPath $root)) { continue }
-    $candidate = Get-ChildItem -LiteralPath $root -Directory -Filter "OpenAI.Codex_*" -ErrorAction SilentlyContinue |
+    Get-ChildItem -LiteralPath $root -Directory -Filter "OpenAI.Codex_*" -ErrorAction SilentlyContinue |
       Sort-Object LastWriteTime -Descending |
       ForEach-Object { Join-Path $_.FullName "app\resources\codex.exe" } |
       Where-Object { Test-Path -LiteralPath $_ } |
-      Select-Object -First 1
-    if ($candidate) { return $candidate }
+      ForEach-Object { $candidates.Add($_) }
   }
 
-  throw "Could not find codex.exe."
+  foreach ($candidate in ($candidates | Select-Object -Unique)) {
+    try {
+      & $candidate "--version" *> $null
+      if ($LASTEXITCODE -eq 0) {
+        return $candidate
+      }
+    } catch {
+      continue
+    }
+  }
+
+  throw "Could not find a runnable codex CLI."
 }
 
 $codexCli = Resolve-CodexCli
 $configPath = Join-Path $CodexHome "config.toml"
 $mirror = Join-Path $CodexHome "bundled-marketplaces\openai-bundled"
+$resourcesMirror = Join-Path $CodexHome "bundled-resources\plugins\openai-bundled"
 
 Write-Host "Codex CLI: $codexCli"
 Write-Host "Expected marketplace mirror: $mirror"
+Write-Host "Expected resources mirror: $resourcesMirror"
 Write-Host ""
 
 $marketplaces = & $codexCli plugin marketplace list
@@ -51,6 +65,13 @@ if (-not $marketplacesText.Contains("bundled-marketplaces\openai-bundled")) {
   $failed = $true
 } else {
   Write-Host "OK: openai-bundled marketplace points to the expected mirror."
+}
+
+if (Test-Path -LiteralPath (Join-Path $resourcesMirror ".agents\plugins\marketplace.json")) {
+  Write-Host "OK: resources-shaped bundled mirror exists."
+} else {
+  Write-Host "FAIL: resources-shaped bundled mirror is missing."
+  $failed = $true
 }
 
 foreach ($plugin in $Plugins) {
@@ -72,6 +93,43 @@ if (Test-Path -LiteralPath $configPath) {
   } else {
     Write-Host 'OK: stale [plugins."browser-use@openai-bundled"] entry is absent.'
   }
+
+  $openAiBundledMarketplaceBlock = [regex]::Match($configText, '(?ms)^\[marketplaces\.openai-bundled\]\s*(.*?)(?=^\[|\z)')
+  if ($openAiBundledMarketplaceBlock.Success -and $openAiBundledMarketplaceBlock.Value.Contains("\\?\")) {
+    Write-Host 'WARN: [marketplaces.openai-bundled] contains a \\?\ long path. Prefer a normal C:\... path if the UI behaves differently from the CLI.'
+  }
+}
+
+if ($Plugins -contains "computer-use") {
+  $computerUseCache = Join-Path $CodexHome "plugins\cache\openai-bundled\computer-use"
+  $computerUseVersion = $null
+  if (Test-Path -LiteralPath $computerUseCache) {
+    $computerUseVersion = Get-ChildItem -LiteralPath $computerUseCache -Directory |
+      Sort-Object LastWriteTime -Descending |
+      Select-Object -First 1
+  }
+
+  if ($computerUseVersion) {
+    $helper = Join-Path $computerUseVersion.FullName "node_modules\@oai\sky\bin\windows\codex-computer-use.exe"
+
+    if (Test-Path -LiteralPath $helper) {
+      Write-Host "OK: Computer Use helper exists."
+    } else {
+      Write-Host "FAIL: Computer Use helper is missing: $helper"
+      $failed = $true
+    }
+
+    $transport = Get-ChildItem -LiteralPath $computerUseVersion.FullName -Recurse -Force -File -Filter "*transport*.js" -ErrorAction SilentlyContinue |
+      Select-Object -First 1
+    if ($transport) {
+      Write-Host "OK: Computer Use transport implementation exists."
+    } else {
+      Write-Host "WARN: Computer Use transport implementation was not found by filename scan. This can be normal if the version bundles transport code differently."
+    }
+  } else {
+    Write-Host "FAIL: computer-use plugin cache is missing."
+    $failed = $true
+  }
 }
 
 Write-Host ""
@@ -81,3 +139,4 @@ if ($failed) {
 }
 
 Write-Host "Verification passed."
+Write-Host "If Codex Desktop is already open, restart it or refresh the window so it reloads the plugin list."

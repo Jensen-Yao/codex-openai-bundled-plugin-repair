@@ -3,7 +3,8 @@
 param(
   [string]$CodexHome = (Join-Path $env:USERPROFILE ".codex"),
   [string]$CodexInstallRoot,
-  [string[]]$Plugins = @("browser", "computer-use", "chrome")
+  [string[]]$Plugins = @("browser", "computer-use", "chrome", "latex"),
+  [switch]$SetUserResourcesEnvironmentVariable
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,15 +30,15 @@ function Resolve-CodexResourcesRoot {
     }
   }
 
-  $windowsAppsRoots = @(
-    (Join-Path $env:ProgramFiles "WindowsApps"),
-    "C:\WindowsApps",
-    "D:\WindowsApps",
-    "E:\WindowsApps",
-    "F:\WindowsApps"
-  ) | Select-Object -Unique
+  $windowsAppsRoots = New-Object System.Collections.Generic.List[string]
+  if ($env:ProgramFiles) {
+    $windowsAppsRoots.Add((Join-Path $env:ProgramFiles "WindowsApps"))
+  }
+  Get-PSDrive -PSProvider FileSystem | ForEach-Object {
+    $windowsAppsRoots.Add((Join-Path $_.Root "WindowsApps"))
+  }
 
-  foreach ($root in $windowsAppsRoots) {
+  foreach ($root in ($windowsAppsRoots | Select-Object -Unique)) {
     if (-not (Test-Path -LiteralPath $root)) { continue }
     Get-ChildItem -LiteralPath $root -Directory -Filter "OpenAI.Codex_*" -ErrorAction SilentlyContinue |
       Sort-Object LastWriteTime -Descending |
@@ -61,17 +62,31 @@ function Resolve-CodexResourcesRoot {
 function Resolve-CodexCli {
   param([string]$ResourcesRoot)
 
-  $bundled = Join-Path $ResourcesRoot "codex.exe"
-  if (Test-Path -LiteralPath $bundled) {
-    return $bundled
-  }
+  $candidates = New-Object System.Collections.Generic.List[string]
 
   $fromPath = Get-Command "codex" -ErrorAction SilentlyContinue
   if ($fromPath) {
-    return $fromPath.Source
+    $candidates.Add($fromPath.Source)
   }
 
-  throw "Could not find codex.exe."
+  $bundled = Join-Path $ResourcesRoot "codex.exe"
+  if (Test-Path -LiteralPath $bundled) {
+    $candidates.Add($bundled)
+  }
+
+  foreach ($candidate in ($candidates | Select-Object -Unique)) {
+    try {
+      & $candidate "--version" *> $null
+      if ($LASTEXITCODE -eq 0) {
+        return $candidate
+      }
+      Write-Host "Skipping unusable Codex CLI: $candidate"
+    } catch {
+      Write-Host "Skipping blocked Codex CLI: $candidate"
+    }
+  }
+
+  throw "Could not find a runnable codex CLI. If WindowsApps blocks direct execution, copy the CLI to a user-owned directory or put codex on PATH."
 }
 
 function Copy-DirectoryByBytes {
@@ -118,6 +133,105 @@ function Invoke-Codex {
   if ($exitCode -ne 0 -and -not $AllowFailure) {
     throw "codex command failed with exit code ${exitCode}: $($Arguments -join ' ')"
   }
+}
+
+function Get-CodexPluginListText {
+  param([string]$CodexCli)
+
+  $output = & $CodexCli plugin list
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -ne 0) {
+    throw "codex plugin list failed with exit code ${exitCode}"
+  }
+  return ($output -join "`n")
+}
+
+function Test-PluginInstalledEnabled {
+  param(
+    [string]$PluginListText,
+    [string]$PluginId
+  )
+
+  $pattern = [regex]::Escape($PluginId) + ".*installed, enabled"
+  return $PluginListText -match $pattern
+}
+
+function Ensure-PluginEnabledConfig {
+  param(
+    [string]$ConfigPath,
+    [string]$PluginId
+  )
+
+  $section = '[plugins."{0}"]' -f $PluginId
+  if (-not (Test-Path -LiteralPath $ConfigPath)) {
+    [IO.File]::WriteAllLines($ConfigPath, @($section, "enabled = true", ""), [Text.UTF8Encoding]::new($false))
+    return
+  }
+
+  $lines = [System.Collections.Generic.List[string]]::new()
+  $inSection = $false
+  $seenSection = $false
+  $seenEnabled = $false
+
+  foreach ($line in [IO.File]::ReadAllLines($ConfigPath)) {
+    if ($line -eq $section) {
+      $inSection = $true
+      $seenSection = $true
+      $seenEnabled = $false
+      $lines.Add($line)
+      continue
+    }
+
+    if ($inSection -and $line -match '^\s*\[.+\]\s*$') {
+      if (-not $seenEnabled) {
+        $lines.Add("enabled = true")
+      }
+      $inSection = $false
+    }
+
+    if ($inSection -and $line -match '^\s*enabled\s*=') {
+      $lines.Add("enabled = true")
+      $seenEnabled = $true
+      continue
+    }
+
+    $lines.Add($line)
+  }
+
+  if ($inSection -and -not $seenEnabled) {
+    $lines.Add("enabled = true")
+  }
+
+  if (-not $seenSection) {
+    if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -ne "") {
+      $lines.Add("")
+    }
+    $lines.Add($section)
+    $lines.Add("enabled = true")
+  }
+
+  [IO.File]::WriteAllLines($ConfigPath, $lines, [Text.UTF8Encoding]::new($false))
+}
+
+function Normalize-OpenAiBundledMarketplacePath {
+  param(
+    [string]$ConfigPath,
+    [string]$Mirror
+  )
+
+  if (-not (Test-Path -LiteralPath $ConfigPath)) { return $false }
+
+  $normalMirror = [IO.Path]::GetFullPath($Mirror).TrimEnd("\")
+  $longMirror = "\\?\" + $normalMirror
+  $text = Get-Content -Raw -LiteralPath $ConfigPath
+  $updated = $text.Replace($longMirror, $normalMirror)
+
+  if ($updated -ne $text) {
+    [IO.File]::WriteAllText($ConfigPath, $updated, [Text.UTF8Encoding]::new($false))
+    return $true
+  }
+
+  return $false
 }
 
 function Remove-StaleBrowserUseConfig {
@@ -174,13 +288,33 @@ $copied = Copy-DirectoryByBytes -Source $sourceMarketplace -Destination $mirror
 Write-Host "Mirror: $mirror"
 Write-Host "Files copied: $copied"
 
+Write-Step "Mirroring resources-shaped bundled plugin source"
+$resourcesMirrorRoot = Join-Path $CodexHome "bundled-resources"
+$resourcesMirror = Join-Path $resourcesMirrorRoot "plugins\openai-bundled"
+$resourcesCopied = Copy-DirectoryByBytes -Source $sourceMarketplace -Destination $resourcesMirror
+Write-Host "Resources mirror: $resourcesMirror"
+Write-Host "Files copied: $resourcesCopied"
+
 Write-Step "Registering marketplace"
 Invoke-Codex -CodexCli $codexCli -Arguments @("plugin", "marketplace", "remove", "openai-bundled") -AllowFailure
 Invoke-Codex -CodexCli $codexCli -Arguments @("plugin", "marketplace", "add", $mirror)
+if (Normalize-OpenAiBundledMarketplacePath -ConfigPath $configPath -Mirror $mirror) {
+  Write-Host "Normalized openai-bundled marketplace path in config.toml."
+}
 
 Write-Step "Installing bundled plugins"
+$pluginListText = Get-CodexPluginListText -CodexCli $codexCli
 foreach ($plugin in $Plugins) {
-  Invoke-Codex -CodexCli $codexCli -Arguments @("plugin", "add", "$plugin@openai-bundled")
+  $pluginId = "$plugin@openai-bundled"
+  if (Test-PluginInstalledEnabled -PluginListText $pluginListText -PluginId $pluginId) {
+    Write-Host "Already installed and enabled: $pluginId"
+    Ensure-PluginEnabledConfig -ConfigPath $configPath -PluginId $pluginId
+    continue
+  }
+
+  Invoke-Codex -CodexCli $codexCli -Arguments @("plugin", "add", $pluginId)
+  Ensure-PluginEnabledConfig -ConfigPath $configPath -PluginId $pluginId
+  $pluginListText = Get-CodexPluginListText -CodexCli $codexCli
 }
 
 Write-Step "Cleaning stale plugin key"
@@ -193,6 +327,15 @@ if (Remove-StaleBrowserUseConfig -ConfigPath $configPath) {
 Write-Step "Current plugin status"
 Invoke-Codex -CodexCli $codexCli -Arguments @("plugin", "marketplace", "list")
 Invoke-Codex -CodexCli $codexCli -Arguments @("plugin", "list")
+
+Write-Step "Persistent resources path"
+Write-Host "Resources root: $resourcesMirrorRoot"
+Write-Host "Optional user environment variable:"
+Write-Host ('[Environment]::SetEnvironmentVariable("CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH", "{0}", "User")' -f $resourcesMirrorRoot)
+if ($SetUserResourcesEnvironmentVariable) {
+  [Environment]::SetEnvironmentVariable("CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH", $resourcesMirrorRoot, "User")
+  Write-Host "Set CODEX_ELECTRON_BUNDLED_PLUGINS_RESOURCES_PATH for future user sessions."
+}
 
 Write-Host ""
 Write-Host "Done. Restart Codex Desktop or refresh its window if the settings page still shows unavailable."
